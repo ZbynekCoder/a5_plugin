@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "7")
 
 import argparse
 import json
@@ -61,27 +61,36 @@ def parse_args():
     p.add_argument("--gpt2_name", type=str, default="openai-community/gpt2")
     p.add_argument("--inject_layer", type=int, default=8)
     p.add_argument("--d_state", type=int, default=128)
-    p.add_argument("--state_stride", type=int, default=1,
-                   help="For gpt2_state: refresh injected teacher state every K steps (K>=1).")
+    p.add_argument("--inject_style", type=str, default="input_add", choices=["input_add", "fusion", "both"])
+    p.add_argument(
+        "--state_stride",
+        type=int,
+        default=1,
+        help="For gpt2_state (inject_mode=clean): hold the injected PRE-state for K steps (K>=1).",
+    )
     p.add_argument("--local_files_only", action="store_true")
 
-    # ---- TRAIN-TIME ablations (normally keep FALSE for clean training) ----
-    # (You can still use these if you want to do "training-time ablation",
-    #  but for Scheme B, keep them OFF and use eval-only ablations below.)
+    # ---- TRAIN-TIME ablations ----
     p.add_argument("--shuffle_state", action="store_true")
     p.add_argument("--reset_state", action="store_true")
     p.add_argument("--gate_zero", action="store_true")
 
-    # ---- EVAL-ONLY ablations (Scheme B: causal intervention at eval) ----
-    # If enabled, eval will report multiple tags: clean + selected eval-only interventions.
-    p.add_argument("--eval_multi", action="store_true",
-                   help="If set, evaluate clean and selected eval-only interventions each eval event.")
-    p.add_argument("--eval_gate_zero", action="store_true",
-                   help="Eval-only: gate=0 for gpt2_state (state channel disabled).")
-    p.add_argument("--eval_shuffle_state", action="store_true",
-                   help="Eval-only: shuffle teacher states over time.")
-    p.add_argument("--eval_reset_state", action="store_true",
-                   help="Eval-only: reset teacher state each step.")
+    # Train-time injection mode
+    p.add_argument(
+        "--train_inject_mode",
+        type=str,
+        default="clean",
+        choices=["clean", "final", "prev", "none"],
+        help="Train-time injection mode for gpt2_state. clean=PRE-states (anti-leak). final is oracle leak.",
+    )
+
+    # ---- EVAL bundle ----
+    p.add_argument("--eval_multi", action="store_true")
+    p.add_argument("--eval_inject_modes", type=str, default="clean,final,prev,none")
+
+    p.add_argument("--eval_gate_zero", action="store_true")
+    p.add_argument("--eval_shuffle_state", action="store_true")
+    p.add_argument("--eval_reset_state", action="store_true")
 
     # optimization
     p.add_argument("--batch_size", type=int, default=512)
@@ -159,12 +168,6 @@ def build_model(args, mul, id_id, device):
 
 
 def train_step(model, args, x, y):
-    # Optional aux anneal for route1
-    if args.model == "route1" and args.anneal_aux:
-        # simple piecewise schedule (customize if needed)
-        # NOTE: if you want to anneal by global step, implement outside and set model._aux_weight_override.
-        pass
-
     if args.model in {"exact", "route1"}:
         return model(
             x,
@@ -175,7 +178,6 @@ def train_step(model, args, x, y):
         )
 
     if args.model == "gpt2_state":
-        # TRAIN-TIME ablations (keep OFF for Scheme B clean training)
         return model(
             x,
             labels=y,
@@ -183,31 +185,53 @@ def train_step(model, args, x, y):
             reset_state=args.reset_state,
             gate_zero=args.gate_zero,
             state_stride=args.state_stride,
+            inject_mode=args.train_inject_mode,
+            inject_style=args.inject_style,
         )
 
     return model(x, labels=y)
 
 
+def _parse_eval_inject_modes(s: str):
+    modes = []
+    for t in s.split(","):
+        m = t.strip()
+        if not m:
+            continue
+        if m not in {"clean", "final", "prev", "none"}:
+            raise ValueError(f"Unknown inject mode: {m}")
+        modes.append(m)
+    if not modes:
+        modes = ["clean"]
+
+    seen = set()
+    uniq = []
+    for m in modes:
+        if m not in seen:
+            uniq.append(m)
+            seen.add(m)
+    return uniq
+
+
 @torch.no_grad()
 def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len):
-    """
-    Scheme B:
-      - Always evaluate clean.
-      - If args.eval_multi: also evaluate selected eval-only interventions
-        (gate_zero / shuffle_state / reset_state) on the same trained model.
-    """
-    # Define eval configurations
-    eval_confs = [("clean", dict(shuffle_state=False, reset_state=False, gate_zero=False))]
+    eval_modes = ["clean"]
+    if args.model == "gpt2_state" and args.eval_multi:
+        eval_modes = _parse_eval_inject_modes(args.eval_inject_modes)
+
+    eval_confs = []
+    for mode in eval_modes:
+        eval_confs.append((mode, dict(inject_mode=mode, shuffle_state=False, reset_state=False, gate_zero=False)))
 
     if args.model == "gpt2_state" and args.eval_multi:
         if args.eval_gate_zero:
-            eval_confs.append(("gate0", dict(shuffle_state=False, reset_state=False, gate_zero=True)))
+            eval_confs.append(("clean+gate0", dict(inject_mode="clean", shuffle_state=False, reset_state=False, gate_zero=True)))
         if args.eval_shuffle_state:
-            eval_confs.append(("shuffle", dict(shuffle_state=True, reset_state=False, gate_zero=False)))
+            eval_confs.append(("clean+shuffle", dict(inject_mode="clean", shuffle_state=True, reset_state=False, gate_zero=False)))
         if args.eval_reset_state:
-            eval_confs.append(("reset", dict(shuffle_state=False, reset_state=True, gate_zero=False)))
+            eval_confs.append(("clean+reset", dict(inject_mode="clean", shuffle_state=False, reset_state=True, gate_zero=False)))
 
-    for eval_tag, st_ablate in eval_confs:
+    for eval_tag, conf in eval_confs:
         for L, loader in eval_loaders.items():
             acc = eval_final_acc(
                 model,
@@ -217,38 +241,37 @@ def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len
                 no_scan=args.no_scan,
                 shuffle_M=args.shuffle_M,
                 reset_each_step=args.reset_each_step,
-                shuffle_state=st_ablate["shuffle_state"],
-                reset_state=st_ablate["reset_state"],
-                gate_zero=st_ablate["gate_zero"],
+                shuffle_state=conf["shuffle_state"],
+                reset_state=conf["reset_state"],
+                gate_zero=conf["gate_zero"],
                 state_stride=args.state_stride,
+                inject_mode=conf["inject_mode"],
+                inject_style=args.inject_style,
             )
 
-            print(f"[eval] step {step} | model {args.model} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")
+            print(f"[eval] step {step} | model {args.model} | style {args.inject_style} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")
 
             rec = {
+                "type": "eval",
                 "step": step,
                 "stage_len": stage_len,
                 "model": args.model,
+                "inject_style": args.inject_style,
                 "eval_tag": eval_tag,
                 "len": L,
                 "final_acc": acc,
-                "train_time_ablation": {
-                    "no_scan": args.no_scan,
-                    "shuffle_M": args.shuffle_M,
-                    "reset_each_step": args.reset_each_step,
+                "train_time": {
+                    "train_inject_mode": args.train_inject_mode,
                     "shuffle_state": args.shuffle_state,
                     "reset_state": args.reset_state,
                     "gate_zero": args.gate_zero,
                 },
-                "eval_only_ablation": st_ablate,
+                "eval_conf": conf,
                 "hparams": {
-                    "temp": args.temp if args.model == "route1" else None,
-                    "aux_weight": args.aux_weight if args.model == "route1" else None,
-                    "anneal_aux": args.anneal_aux if args.model == "route1" else None,
                     "gpt2_name": args.gpt2_name if args.model in {"gpt2", "gpt2_state"} else None,
                     "inject_layer": args.inject_layer if args.model == "gpt2_state" else None,
                     "d_state": args.d_state if args.model == "gpt2_state" else None,
-                    "local_files_only": args.local_files_only if args.model in {"gpt2", "gpt2_state"} else None,
+                    "state_stride": args.state_stride if args.model == "gpt2_state" else None,
                 },
             }
             with open(log_path, "a", encoding="utf-8") as f:
@@ -283,6 +306,9 @@ def main():
     if os.path.exists(log_path):
         os.remove(log_path)
 
+    win_correct = 0
+    win_total = 0
+
     step = 0
     for stage_len in schedule:
         ds_train = RandomSeqFinalDataset(mul, id_id, length=stage_len, num_samples=args.train_samples, seed=args.seed + stage_len)
@@ -303,6 +329,10 @@ def main():
 
             logits, loss = train_step(model, args, x, y)
 
+            pred = logits.argmax(dim=-1)
+            win_correct += (pred == y).sum().item()
+            win_total += y.numel()
+
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
@@ -310,7 +340,11 @@ def main():
                 optimizer.step()
 
             if step % args.log_every == 0:
-                print(f"step {step} | stage_len {stage_len} | loss {loss.item():.6f}")
+                train_acc = win_correct / max(win_total, 1)
+                print(f"step {step} | stage_len {stage_len} | loss {loss.item():.6f} | train_acc(win) {train_acc:.4f}")
+
+                win_correct = 0
+                win_total = 0
 
             if step % args.eval_every == 0 and step > 0:
                 run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len)

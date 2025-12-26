@@ -1,8 +1,13 @@
-from typing import Optional, List
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from transformers import AutoModel
+except Exception:
+    AutoModel = None
 
 
 # ----------------------------
@@ -10,7 +15,6 @@ import torch.nn.functional as F
 # ----------------------------
 
 class BaselineAdapter(nn.Module):
-    """Token-wise MLP + pooling (non-sequential baseline)."""
     def __init__(self, num_tokens: int = 60, d_model: int = 64, mlp_layers: int = 2, pool: str = "mean"):
         super().__init__()
         self.embed = nn.Embedding(num_tokens, d_model)
@@ -24,24 +28,22 @@ class BaselineAdapter(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None):
-        x = self.embed(input_ids)      # [B,T,D]
-        x = self.mlp(x)                # [B,T,D]
-        if self.pool == "mean":
-            h = x.mean(dim=1)
-        else:
-            h = x[:, -1]
+        x = self.embed(input_ids)
+        x = self.mlp(x)
+        h = x.mean(dim=1) if self.pool == "mean" else x[:, -1]
         logits = self.head(h)
         loss = self.loss_fn(logits, labels) if labels is not None else None
         return logits, loss
 
 
 class GRUBaseline(nn.Module):
-    """Embedding -> GRU -> last hidden -> Linear."""
     def __init__(self, num_tokens: int = 60, d_model: int = 128, num_layers: int = 1, dropout: float = 0.0):
         super().__init__()
         self.embed = nn.Embedding(num_tokens, d_model)
-        self.gru = nn.GRU(d_model, d_model, num_layers=num_layers, batch_first=True,
-                          dropout=dropout if num_layers > 1 else 0.0)
+        self.gru = nn.GRU(
+            d_model, d_model, num_layers=num_layers, batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
         self.head = nn.Linear(d_model, num_tokens)
         self.loss_fn = nn.CrossEntropyLoss()
 
@@ -58,10 +60,6 @@ class GRUBaseline(nn.Module):
 # ----------------------------
 
 class A5ExactScan(nn.Module):
-    """
-    Fixed Cayley table + scan.
-    Output logits = log(onehot(final_state)).
-    """
     def __init__(self, mul_table, id_id: int, num_tokens: int = 60):
         super().__init__()
         if not torch.is_tensor(mul_table):
@@ -71,13 +69,14 @@ class A5ExactScan(nn.Module):
         self.num_tokens = int(num_tokens)
         self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
-                no_scan: bool = False, shuffle_M: bool = False, reset_each_step: bool = False):
-        """
-        no_scan: do not update state (stay identity)
-        shuffle_M: shuffle the Cayley table rows/cols (break group structure)
-        reset_each_step: reset state each step (kill accumulation)
-        """
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        no_scan: bool = False,
+        shuffle_M: bool = False,
+        reset_each_step: bool = False,
+    ):
         B, T = input_ids.shape
         device = input_ids.device
 
@@ -87,16 +86,15 @@ class A5ExactScan(nn.Module):
             mul = mul[perm][:, perm]
 
         s = torch.full((B,), self.id_id, device=device, dtype=torch.long)
-
         if not no_scan:
             for t in range(T):
                 if reset_each_step:
                     s.fill_(self.id_id)
                 g = input_ids[:, t]
-                s = mul[g, s]  # left multiply
+                s = mul[g, s]
 
         logits_final = torch.full((B, self.num_tokens), -50.0, device=device)
-        logits_final.scatter_(1, s.view(-1, 1), 0.0)  # log(onehot)
+        logits_final.scatter_(1, s.view(-1, 1), 0.0)
 
         loss = self.loss_fn(logits_final, labels) if labels is not None else None
         return logits_final, loss
@@ -107,13 +105,15 @@ class A5ExactScan(nn.Module):
 # ----------------------------
 
 class Route1SoftScan(nn.Module):
-    """
-    Learnable router: token -> distribution over 60 group elements.
-    Fixed executor: Cayley table + scan on distribution (soft).
-    Aux supervision: CE(router_logits, token_id) to bootstrap identity routing.
-    """
-    def __init__(self, mul_table, id_id: int, num_tokens: int = 60,
-                 d_model: int = 128, temp: float = 1.0, aux_weight: float = 5.0):
+    def __init__(
+        self,
+        mul_table,
+        id_id: int,
+        num_tokens: int = 60,
+        d_model: int = 128,
+        temp: float = 1.0,
+        aux_weight: float = 5.0,
+    ):
         super().__init__()
         if not torch.is_tensor(mul_table):
             mul_table = torch.tensor(mul_table, dtype=torch.long)
@@ -131,14 +131,16 @@ class Route1SoftScan(nn.Module):
         self.temp = float(temp)
         self.aux_weight = float(aux_weight)
         self._aux_weight_override = None
-
         self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
-                no_scan: bool = False, shuffle_M: bool = False, reset_each_step: bool = False):
-        """
-        no_scan/shuffle_M/reset_each_step: mechanism ablations for executor.
-        """
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        no_scan: bool = False,
+        shuffle_M: bool = False,
+        reset_each_step: bool = False,
+    ):
         B, T = input_ids.shape
         device = input_ids.device
 
@@ -147,32 +149,27 @@ class Route1SoftScan(nn.Module):
             perm = torch.randperm(self.num_tokens, device=device)
             mul = mul[perm][:, perm]
 
-        x = input_ids
-        h = self.embed(x)                       # [B,T,D]
-        logits_g = self.router(h)               # [B,T,60]
-        p_g = F.softmax(logits_g / self.temp, dim=-1)  # [B,T,60]
+        h = self.embed(input_ids)
+        logits_g = self.router(h)
+        p_g = F.softmax(logits_g / self.temp, dim=-1)
 
-        # state distribution
         s_dist = torch.zeros((B, self.num_tokens), device=device)
         s_dist[:, self.id_id] = 1.0
 
         if not no_scan:
-            # precompute "left-multiply operator" as a permutation matrix over ids for each g
-            # next_s[j] = sum_{g,prev} p_g[g] * s_dist[prev] where j = mul[g, prev]
             for t in range(T):
                 if reset_each_step:
                     s_dist.zero_()
                     s_dist[:, self.id_id] = 1.0
-
-                pg = p_g[:, t]  # [B,60]
-                # compute next_s via scatter-add
+                pg = p_g[:, t]
                 next_s = torch.zeros_like(s_dist)
-                # for each g, move mass of s_dist to mul[g, :]
-                # vectorized: for each prev_state k, it goes to mul[g,k]
-                # We'll do per g loop (60) which is fine.
                 for g in range(self.num_tokens):
-                    dest = mul[g]  # [60] mapping prev->dest
-                    next_s.scatter_add_(1, dest.view(1, -1).expand(B, -1), (pg[:, g].view(B, 1) * s_dist))
+                    dest = mul[g]
+                    next_s.scatter_add_(
+                        1,
+                        dest.view(1, -1).expand(B, -1),
+                        (pg[:, g].view(B, 1) * s_dist),
+                    )
                 s_dist = next_s
 
         logits_final = (s_dist.clamp_min(1e-9)).log()
@@ -180,36 +177,29 @@ class Route1SoftScan(nn.Module):
         loss = None
         if labels is not None:
             loss_final = self.loss_fn(logits_final, labels)
-            loss_route = F.cross_entropy(logits_g.reshape(-1, self.num_tokens), x.reshape(-1))
-
-            w = self.aux_weight
-            if self._aux_weight_override is not None:
-                w = float(self._aux_weight_override)
+            loss_route = F.cross_entropy(logits_g.reshape(-1, self.num_tokens), input_ids.reshape(-1))
+            w = self.aux_weight if self._aux_weight_override is None else float(self._aux_weight_override)
             loss = loss_final + w * loss_route
 
         return logits_final, loss
 
 
 # ============================
-# Frozen GPT-2 baselines + Teacher-state fusion plugin
+# Frozen GPT-2 baselines + Teacher-state injection
 # ============================
 
-from typing import Tuple
-
-try:
-    from transformers import AutoModel
-except Exception:
-    AutoModel = None
-
-
-def _compute_prefix_states(input_ids: torch.Tensor, mul: torch.Tensor, id_id: int,
-                           shuffle_state: bool = False, reset_state: bool = False) -> torch.Tensor:
+def _compute_prefix_states(
+    input_ids: torch.Tensor,
+    mul: torch.Tensor,
+    id_id: int,
+    shuffle_state: bool = False,
+    reset_state: bool = False,
+) -> torch.Tensor:
     """
-    Teacher state s_t computed by exact executor:
+    POST-states after consuming token t:
       s_0 = id
-      s_t = x_t ∘ s_{t-1}  (left multiply)
-    Returns:
-      state_ids: LongTensor [B, T]
+      s_{t+1} = x_t ∘ s_t
+      states[:, t] = s_{t+1}
     """
     B, T = input_ids.shape
     device = input_ids.device
@@ -229,12 +219,12 @@ def _compute_prefix_states(input_ids: torch.Tensor, mul: torch.Tensor, id_id: in
 
 
 class GPT2FrozenBaseline(nn.Module):
-    """
-    Baseline:
-      (trainable token embedding) -> frozen HF GPT-2 backbone -> last hidden -> Linear(60)
-    """
-    def __init__(self, num_tokens: int = 60, gpt2_name: str = "openai-community/gpt2",
-                 local_files_only: bool = False):
+    def __init__(
+        self,
+        num_tokens: int = 60,
+        gpt2_name: str = "openai-community/gpt2",
+        local_files_only: bool = False,
+    ):
         super().__init__()
         if AutoModel is None:
             raise ImportError("transformers not installed. pip install transformers")
@@ -250,9 +240,7 @@ class GPT2FrozenBaseline(nn.Module):
         self.n_embd = int(self.gpt2.config.n_embd)
         self.num_tokens = int(num_tokens)
 
-        # small trainable front-end
         self.tok_emb = nn.Embedding(self.num_tokens, self.n_embd)
-
         self.head = nn.Linear(self.n_embd, self.num_tokens)
         self.loss_fn = nn.CrossEntropyLoss()
 
@@ -260,9 +248,9 @@ class GPT2FrozenBaseline(nn.Module):
         B, T = input_ids.shape
         attn_mask = torch.ones((B, T), device=input_ids.device, dtype=torch.long)
 
-        x = self.tok_emb(input_ids)  # [B,T,H]
+        x = self.tok_emb(input_ids)
         out = self.gpt2(inputs_embeds=x, attention_mask=attn_mask, use_cache=False, return_dict=True)
-        h_last = out.last_hidden_state[:, -1]  # [B,H]
+        h_last = out.last_hidden_state[:, -1]
         logits = self.head(h_last)
         loss = self.loss_fn(logits, labels) if labels is not None else None
         return logits, loss
@@ -270,16 +258,30 @@ class GPT2FrozenBaseline(nn.Module):
 
 class GPT2FrozenStateFusion(nn.Module):
     """
-    Frozen HF GPT-2 backbone + teacher state injection via gated residual fusion at one transformer block.
+    Frozen GPT-2 + teacher state injection.
 
-      h <- h + sigmoid(W_h h + W_s s) ⊙ W_d s
+    inject_mode semantics (IMPORTANT):
+      - clean: inject PRE-states (pre_state[t] = s_{t-1}), i.e. last pos gets s_{T-1} (anti-leak)
+      - final: only last pos gets s_T (oracle)
+      - prev : only last pos gets s_{T-1}
+      - none : inject nothing
 
-    The teacher state s_t is computed exactly from the Cayley table (mul).
+    inject_style:
+      - input_add: x = tok_emb + (masked state)
+      - fusion    : use gated residual fusion hook at inject_layer
+      - both      : do both (debug / sanity)
     """
-    def __init__(self, mul_table, id_id: int, num_tokens: int = 60,
-                 gpt2_name: str = "openai-community/gpt2",
-                 inject_layer: int = 8, d_state: int = 128,
-                 local_files_only: bool = False):
+
+    def __init__(
+        self,
+        mul_table,
+        id_id: int,
+        num_tokens: int = 60,
+        gpt2_name: str = "openai-community/gpt2",
+        inject_layer: int = 8,
+        d_state: int = 128,
+        local_files_only: bool = False,
+    ):
         super().__init__()
         if AutoModel is None:
             raise ImportError("transformers not installed. pip install transformers")
@@ -288,7 +290,7 @@ class GPT2FrozenStateFusion(nn.Module):
             mul_table = torch.tensor(mul_table, dtype=torch.long)
         else:
             mul_table = mul_table.long()
-        self.register_buffer("mul", mul_table)  # [60,60]
+        self.register_buffer("mul", mul_table)
         self.id_id = int(id_id)
         self.num_tokens = int(num_tokens)
 
@@ -302,11 +304,11 @@ class GPT2FrozenStateFusion(nn.Module):
 
         self.n_embd = int(self.gpt2.config.n_embd)
 
-        # trainable small modules
         self.tok_emb = nn.Embedding(self.num_tokens, self.n_embd)
         self.state_emb = nn.Embedding(self.num_tokens, int(d_state))
         self.state_proj = nn.Linear(int(d_state), self.n_embd)
 
+        # fusion params
         self.W_h = nn.Linear(self.n_embd, self.n_embd, bias=True)
         self.W_s = nn.Linear(self.n_embd, self.n_embd, bias=True)
         self.W_d = nn.Linear(self.n_embd, self.n_embd, bias=True)
@@ -314,55 +316,33 @@ class GPT2FrozenStateFusion(nn.Module):
         self.head = nn.Linear(self.n_embd, self.num_tokens)
         self.loss_fn = nn.CrossEntropyLoss()
 
-        # cache for hook
         self._cached_s = None
         self._cached_gate_zero = False
 
-        # --- locate transformer blocks robustly across HF versions ---
+        # locate transformer blocks
         blocks = None
-
-        # Case 1: AutoModel returns GPT2LMHeadModel-like wrapper: model.transformer.h
         if hasattr(self.gpt2, "transformer") and hasattr(self.gpt2.transformer, "h"):
             blocks = self.gpt2.transformer.h
-
-        # Case 2: AutoModel returns GPT2Model directly: model.h
         elif hasattr(self.gpt2, "h"):
             blocks = self.gpt2.h
-
-        # (Optional) extra fallbacks for odd wrappers
         elif hasattr(self.gpt2, "model") and hasattr(self.gpt2.model, "h"):
             blocks = self.gpt2.model.h
-
         if blocks is None:
-            raise ValueError(
-                "Cannot locate GPT-2 blocks. Expected .transformer.h or .h on the loaded model. "
-                f"Got type={type(self.gpt2)} with attrs={dir(self.gpt2)[:30]}..."
-            )
+            raise ValueError(f"Cannot locate GPT-2 blocks. Got type={type(self.gpt2)}")
 
         n_layer = len(blocks)
         self.inject_layer = int(max(0, min(int(inject_layer), n_layer - 1)))
-
-        block = blocks[self.inject_layer]
-        block.register_forward_hook(self._fusion_hook)
+        blocks[self.inject_layer].register_forward_hook(self._fusion_hook)
         print(f"[GPT2FrozenStateFusion] backbone type: {type(self.gpt2)}")
         print(f"[GPT2FrozenStateFusion] inject_layer: {self.inject_layer} / n_layer: {n_layer}")
 
-
-
     def _fusion_hook(self, module, inputs, output):
-        """
-        output may be tuple(hidden_states, ...) or BaseModelOutput-like.
-        We modify hidden_states in-place by returning a new output object/tuple.
-        """
         if self._cached_s is None or self._cached_gate_zero:
             return output
 
-        if isinstance(output, tuple):
-            hidden = output[0]
-        else:
-            hidden = output
+        hidden = output[0] if isinstance(output, tuple) else output
+        s = self._cached_s  # [B,T,H]
 
-        s = self._cached_s
         gate = torch.sigmoid(self.W_h(hidden) + self.W_s(s))
         delta = self.W_d(s)
         hidden2 = hidden + gate * delta
@@ -372,53 +352,103 @@ class GPT2FrozenStateFusion(nn.Module):
         return hidden2
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            labels: Optional[torch.Tensor] = None,
-            shuffle_state: bool = False,
-            reset_state: bool = False,
-            gate_zero: bool = False,
-            state_stride: int = 1,  # NEW: inject/refresh every K steps
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        shuffle_state: bool = False,
+        reset_state: bool = False,
+        gate_zero: bool = False,
+        state_stride: int = 1,
+        inject_mode: str = "clean",
+        inject_style: str = "input_add",
     ):
-        """
-        state_stride (=K):
-          - K=1: inject fresh teacher state every step (current behavior).
-          - K>1: refresh teacher state every K steps; between refreshes, reuse last injected state.
-        """
+        if inject_mode not in {"clean", "final", "prev", "none"}:
+            raise ValueError(f"Unknown inject_mode: {inject_mode}")
+        if inject_style not in {"input_add", "fusion", "both"}:
+            raise ValueError(f"Unknown inject_style: {inject_style}")
+
         B, T = input_ids.shape
         device = input_ids.device
         attn_mask = torch.ones((B, T), device=device, dtype=torch.long)
 
-        # --- 1) compute teacher prefix states (exact) ---
-        state_ids = _compute_prefix_states(
+        # ---- compute teacher states ----
+        post_state_ids = _compute_prefix_states(
             input_ids,
             self.mul,
             self.id_id,
             shuffle_state=shuffle_state,
             reset_state=reset_state,
-        )  # [B,T] long
+        )  # [B,T] where post[t]=s_{t+1}
 
-        # --- 2) apply stride: only refresh every K steps, otherwise hold last ---
+        # PRE states: pre[0]=id, pre[t]=post[t-1] = s_t
+        if T > 0:
+            pre_state_ids = torch.full((B, T), int(self.id_id), device=device, dtype=torch.long)
+            if T > 1:
+                pre_state_ids[:, 1:] = post_state_ids[:, :-1]
+        else:
+            pre_state_ids = post_state_ids
+
+        # ---- choose state ids ----
+        if inject_mode == "clean":
+            state_ids = pre_state_ids
+        else:
+            state_ids = torch.full((B, T), int(self.id_id), device=device, dtype=torch.long)
+            if T > 0:
+                if inject_mode == "final":
+                    state_ids[:, -1] = post_state_ids[:, -1]  # s_T (oracle)
+                elif inject_mode == "prev":
+                    state_ids[:, -1] = post_state_ids[:, -2] if T >= 2 else int(self.id_id)
+                elif inject_mode == "none":
+                    pass
+
+        # ---- stride-hold on ids (only meaningful for clean) ----
         K = int(state_stride) if state_stride is not None else 1
         if K < 1:
             K = 1
-
-        if K > 1 and T > 0:
-            # hold last refreshed state id
+        if inject_mode == "clean" and K > 1 and T > 0:
             held = state_ids.clone()
-            # For each segment [t0, t0+K-1], copy state at t0 to all positions in segment
             for t0 in range(0, T, K):
                 t1 = min(t0 + K, T)
                 held[:, t0:t1] = state_ids[:, t0:t0 + 1].expand(B, t1 - t0)
             state_ids = held
 
-        # --- 3) embed+project to GPT-2 hidden size ---
+        # ---- embed/project ----
         s = self.state_proj(self.state_emb(state_ids))  # [B,T,H]
+
+        # ---- IMPORTANT: zero-mask non-injected positions (semantic fix) ----
+        # clean: inject all positions
+        # final/prev: inject only last position
+        # none: inject nothing
+        if T == 0:
+            mask = torch.zeros((B, T, 1), device=device, dtype=s.dtype)
+        else:
+            mask = torch.zeros((B, T, 1), device=device, dtype=s.dtype)
+            if inject_mode == "clean":
+                mask[:] = 1.0
+            elif inject_mode in {"final", "prev"}:
+                mask[:, -1, :] = 1.0
+            elif inject_mode == "none":
+                pass
+        s = s * mask  # zero means true no-op; prevents identity-bias artifacts
+
+        # ---- run backbone ----
         x = self.tok_emb(input_ids)  # [B,T,H]
 
-        # set cache for hook (injection happens at inject_layer)
-        self._cached_s = s
-        self._cached_gate_zero = bool(gate_zero)
+        # cache for fusion if requested
+        if inject_style in {"fusion", "both"} and inject_mode != "none":
+            # If mask is all zeros (shouldn't happen except none), skip.
+            if mask.sum().item() > 0:
+                self._cached_s = s
+                self._cached_gate_zero = bool(gate_zero)
+            else:
+                self._cached_s = None
+                self._cached_gate_zero = False
+        else:
+            self._cached_s = None
+            self._cached_gate_zero = False
+
+        if inject_style in {"input_add", "both"}:
+            x = x + s
 
         out = self.gpt2(
             inputs_embeds=x,
@@ -426,13 +456,12 @@ class GPT2FrozenStateFusion(nn.Module):
             use_cache=False,
             return_dict=True,
         )
-        h_last = out.last_hidden_state[:, -1]
-        logits = self.head(h_last)
 
         # clear cache
         self._cached_s = None
         self._cached_gate_zero = False
 
+        h_last = out.last_hidden_state[:, -1]
+        logits = self.head(h_last)
         loss = self.loss_fn(logits, labels) if labels is not None else None
         return logits, loss
-
