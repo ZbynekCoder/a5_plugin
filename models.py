@@ -70,12 +70,12 @@ class A5ExactScan(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        no_scan: bool = False,
-        shuffle_M: bool = False,
-        reset_each_step: bool = False,
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            no_scan: bool = False,
+            shuffle_M: bool = False,
+            reset_each_step: bool = False,
     ):
         B, T = input_ids.shape
         device = input_ids.device
@@ -106,13 +106,13 @@ class A5ExactScan(nn.Module):
 
 class Route1SoftScan(nn.Module):
     def __init__(
-        self,
-        mul_table,
-        id_id: int,
-        num_tokens: int = 60,
-        d_model: int = 128,
-        temp: float = 1.0,
-        aux_weight: float = 5.0,
+            self,
+            mul_table,
+            id_id: int,
+            num_tokens: int = 60,
+            d_model: int = 128,
+            temp: float = 1.0,
+            aux_weight: float = 5.0,
     ):
         super().__init__()
         if not torch.is_tensor(mul_table):
@@ -134,12 +134,12 @@ class Route1SoftScan(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        no_scan: bool = False,
-        shuffle_M: bool = False,
-        reset_each_step: bool = False,
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            no_scan: bool = False,
+            shuffle_M: bool = False,
+            reset_each_step: bool = False,
     ):
         B, T = input_ids.shape
         device = input_ids.device
@@ -189,11 +189,11 @@ class Route1SoftScan(nn.Module):
 # ============================
 
 def _compute_prefix_states(
-    input_ids: torch.Tensor,
-    mul: torch.Tensor,
-    id_id: int,
-    shuffle_state: bool = False,
-    reset_state: bool = False,
+        input_ids: torch.Tensor,
+        mul: torch.Tensor,
+        id_id: int,
+        shuffle_state: bool = False,
+        reset_state: bool = False,
 ) -> torch.Tensor:
     """
     POST-states after consuming token t:
@@ -220,10 +220,10 @@ def _compute_prefix_states(
 
 class GPT2FrozenBaseline(nn.Module):
     def __init__(
-        self,
-        num_tokens: int = 60,
-        gpt2_name: str = "openai-community/gpt2",
-        local_files_only: bool = False,
+            self,
+            num_tokens: int = 60,
+            gpt2_name: str = "openai-community/gpt2",
+            local_files_only: bool = False,
     ):
         super().__init__()
         if AutoModel is None:
@@ -273,14 +273,14 @@ class GPT2FrozenStateFusion(nn.Module):
     """
 
     def __init__(
-        self,
-        mul_table,
-        id_id: int,
-        num_tokens: int = 60,
-        gpt2_name: str = "openai-community/gpt2",
-        inject_layer: int = 8,
-        d_state: int = 128,
-        local_files_only: bool = False,
+            self,
+            mul_table,
+            id_id: int,
+            num_tokens: int = 60,
+            gpt2_name: str = "openai-community/gpt2",
+            inject_layer: int = 8,
+            d_state: int = 128,
+            local_files_only: bool = False,
     ):
         super().__init__()
         if AutoModel is None:
@@ -352,17 +352,19 @@ class GPT2FrozenStateFusion(nn.Module):
         return hidden2
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        shuffle_state: bool = False,
-        reset_state: bool = False,
-        gate_zero: bool = False,
-        state_stride: int = 1,
-        stride_mode: str = "hold",
-        stride_offset: int = 0,
-        inject_mode: str = "clean",
-        inject_style: str = "input_add",
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            shuffle_state: bool = False,
+            reset_state: bool = False,
+            gate_zero: bool = False,
+            state_stride: int = 1,
+            stride_mode: str = "hold",
+            stride_offset: int = 0,
+            inject_mode: str = "clean",
+            inject_style: str = "input_add",
+            random_phase_shift: bool = False,
+            phase_shift_mode: str = "batch",
     ):
         if inject_mode not in {"clean", "final", "prev", "none"}:
             raise ValueError(f"Unknown inject_mode: {inject_mode}")
@@ -425,10 +427,33 @@ class GPT2FrozenStateFusion(nn.Module):
 
             elif stride_mode == "sparse":
                 # sparse behavior: only inject at every K-th position (phase controlled by offset)
-                # Note: we do NOT change state_ids; we mask out injection instead.
                 t = torch.arange(T, device=device)  # [T]
-                keep = ((t - offset) % K == 0).to(torch.float32)  # [T], 1 at injected steps
-                stride_mask = keep.view(1, T, 1).expand(B, T, 1)  # [B,T,1]
+                # ---- random phase-shift (TRAIN-TIME) ----
+                # We randomize the phase of the sparse mask to encourage phase-invariant usage.
+                # This does NOT change state_ids; it only changes which positions are injected (mask=1).
+                if random_phase_shift:
+                    if phase_shift_mode == "batch":
+                        # one shift for the entire batch
+                        shift = int(torch.randint(low=0, high=K, size=(1,), device=device).item())
+                        eff_offset = offset + shift
+                        keep = ((t - eff_offset) % K == 0).to(torch.float32)  # [T]
+                        # ---- FORCE LAST STEP VISIBILITY ----
+                        keep[T - 1] = 1.0
+                        stride_mask = keep.view(1, T, 1).expand(B, T, 1)  # [B,T,1]
+                    elif phase_shift_mode == "sample":
+                        # independent shift per sample
+                        shift = torch.randint(low=0, high=K, size=(B, 1, 1), device=device)  # [B,1,1]
+                        tt = t.view(1, T, 1).expand(B, T, 1)  # [B,T,1]
+                        keep = (((tt - (offset + shift)) % K) == 0).to(torch.float32)  # [B,T,1]
+                        # ---- FORCE LAST STEP VISIBILITY ----
+                        keep[T - 1] = 1.0
+                        stride_mask = keep
+                    else:
+                        raise ValueError(f"Unknown phase_shift_mode: {phase_shift_mode}")
+                else:
+                    # deterministic phase
+                    keep = ((t - offset) % K == 0).to(torch.float32)  # [T]
+                    stride_mask = keep.view(1, T, 1).expand(B, T, 1)  # [B,T,1]
 
         # ---- embed/project ----
         s = self.state_proj(self.state_emb(state_ids))  # [B,T,H]

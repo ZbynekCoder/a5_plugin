@@ -51,6 +51,7 @@ class RandomSeqFinalDataset(Dataset):
     Random sequences of group element ids in [0..59].
     Label: final prefix product y_T = x_T ∘ ... ∘ x_1, computed with mul.
     """
+
     def __init__(self, mul: List[List[int]], id_id: int, length: int, num_samples: int, seed: int = 0):
         super().__init__()
         self.mul = mul
@@ -82,21 +83,23 @@ class RandomSeqFinalDataset(Dataset):
 
 @torch.no_grad()
 def eval_final_acc(
-    model,
-    loader,
-    device,
-    model_name: str,
-    no_scan: bool = False,
-    shuffle_M: bool = False,
-    reset_each_step: bool = False,
-    shuffle_state: bool = False,
-    reset_state: bool = False,
-    gate_zero: bool = False,
-    state_stride: int = 1,
-    stride_mode: str = "hold",
-    stride_offset: int = 0,
-    inject_mode: str = "clean",
-    inject_style: str = "input_add",
+        model,
+        loader,
+        device,
+        model_name: str,
+        no_scan: bool = False,
+        shuffle_M: bool = False,
+        reset_each_step: bool = False,
+        shuffle_state: bool = False,
+        reset_state: bool = False,
+        gate_zero: bool = False,
+        state_stride: int = 1,
+        stride_mode: str = "hold",
+        stride_offset: int = 0,
+        inject_mode: str = "clean",
+        inject_style: str = "input_add",
+        random_phase_shift: bool = False,
+        phase_shift_mode: str = "batch",
 ) -> float:
     model.eval()
     correct = 0
@@ -119,6 +122,8 @@ def eval_final_acc(
                 stride_offset=stride_offset,
                 inject_mode=inject_mode,
                 inject_style=inject_style,
+                random_phase_shift=random_phase_shift,
+                phase_shift_mode=phase_shift_mode,
             )
         else:
             logits, _ = model(x, labels=None)

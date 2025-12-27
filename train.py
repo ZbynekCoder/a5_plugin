@@ -69,6 +69,19 @@ def parse_args():
     )
     p.add_argument("--stride_mode", type=str, default="hold", choices=["hold", "sparse"])
     p.add_argument("--stride_offset", type=int, default=0)
+    # ---- sparse stride phase randomization ----
+    p.add_argument(
+        "--random_phase_shift",
+        action="store_true",
+        help="(gpt2_state + stride_mode=sparse + inject_mode=clean) randomize the sparse injection phase each batch/sample during TRAIN. Disabled by default.",
+    )
+    p.add_argument(
+        "--phase_shift_mode",
+        type=str,
+        default="batch",
+        choices=["batch", "sample"],
+        help="How to randomize phase when --random_phase_shift is enabled. batch=one shift per batch, sample=independent shift per sample.",
+    )
 
     p.add_argument("--local_files_only", action="store_true")
 
@@ -191,6 +204,8 @@ def train_step(model, args, x, y):
             stride_offset=args.stride_offset,
             inject_mode=args.train_inject_mode,
             inject_style=args.inject_style,
+            random_phase_shift=args.random_phase_shift,
+            phase_shift_mode=args.phase_shift_mode,
         )
 
     return model(x, labels=y)
@@ -253,6 +268,8 @@ def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len
                 stride_offset=args.stride_offset,
                 inject_mode=conf["inject_mode"],
                 inject_style=args.inject_style,
+                random_phase_shift=False,
+                phase_shift_mode="batch",
             )
 
             print(f"[eval] step {step} | model {args.model} | style {args.inject_style} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")
