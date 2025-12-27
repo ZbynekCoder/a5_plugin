@@ -93,6 +93,8 @@ def eval_final_acc(
     reset_state: bool = False,
     gate_zero: bool = False,
     state_stride: int = 1,
+    stride_mode: str = "hold",
+    stride_offset: int = 0,
     inject_mode: str = "clean",
     inject_style: str = "input_add",
 ) -> float:
@@ -113,6 +115,8 @@ def eval_final_acc(
                 reset_state=reset_state,
                 gate_zero=gate_zero,
                 state_stride=state_stride,
+                stride_mode=stride_mode,
+                stride_offset=stride_offset,
                 inject_mode=inject_mode,
                 inject_style=inject_style,
             )

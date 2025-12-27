@@ -1,0 +1,14 @@
+python train.py \
+  --model gpt2_state \
+  --gpt2_name openai-community/gpt2 --local_files_only \
+  --device cuda:7 \
+  --train_inject_mode final \
+  --inject_style input_add \
+  --state_stride 2 \
+  --d_state 8 \
+  --inject_layer 8 \
+  --schedule 64 \
+  --steps_per_stage 1000 \
+  --eval_every 200 \
+  --eval_multi \
+  --eval_inject_modes final

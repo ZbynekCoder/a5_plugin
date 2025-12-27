@@ -359,6 +359,8 @@ class GPT2FrozenStateFusion(nn.Module):
         reset_state: bool = False,
         gate_zero: bool = False,
         state_stride: int = 1,
+        stride_mode: str = "hold",
+        stride_offset: int = 0,
         inject_mode: str = "clean",
         inject_style: str = "input_add",
     ):
@@ -401,22 +403,38 @@ class GPT2FrozenStateFusion(nn.Module):
                 elif inject_mode == "none":
                     pass
 
-        # ---- stride-hold on ids (only meaningful for clean) ----
+        # ---- stride handling: hold vs sparse (only meaningful for clean) ----
         K = int(state_stride) if state_stride is not None else 1
         if K < 1:
             K = 1
+        if stride_mode not in {"hold", "sparse"}:
+            raise ValueError(f"Unknown stride_mode: {stride_mode}")
+        offset = int(stride_offset) if stride_offset is not None else 0
+
+        # Default: no extra stride mask
+        stride_mask = None  # [B,T,1] or None
+
         if inject_mode == "clean" and K > 1 and T > 0:
-            held = state_ids.clone()
-            for t0 in range(0, T, K):
-                t1 = min(t0 + K, T)
-                held[:, t0:t1] = state_ids[:, t0:t0 + 1].expand(B, t1 - t0)
-            state_ids = held
+            if stride_mode == "hold":
+                # your original behavior: hold the PRE-state for K steps
+                held = state_ids.clone()
+                for t0 in range(0, T, K):
+                    t1 = min(t0 + K, T)
+                    held[:, t0:t1] = state_ids[:, t0:t0 + 1].expand(B, t1 - t0)
+                state_ids = held
+
+            elif stride_mode == "sparse":
+                # sparse behavior: only inject at every K-th position (phase controlled by offset)
+                # Note: we do NOT change state_ids; we mask out injection instead.
+                t = torch.arange(T, device=device)  # [T]
+                keep = ((t - offset) % K == 0).to(torch.float32)  # [T], 1 at injected steps
+                stride_mask = keep.view(1, T, 1).expand(B, T, 1)  # [B,T,1]
 
         # ---- embed/project ----
         s = self.state_proj(self.state_emb(state_ids))  # [B,T,H]
 
         # ---- IMPORTANT: zero-mask non-injected positions (semantic fix) ----
-        # clean: inject all positions
+        # clean: inject all positions (then optionally apply stride_mask for sparse)
         # final/prev: inject only last position
         # none: inject nothing
         if T == 0:
@@ -429,6 +447,11 @@ class GPT2FrozenStateFusion(nn.Module):
                 mask[:, -1, :] = 1.0
             elif inject_mode == "none":
                 pass
+
+        # Apply sparse stride mask (if any): this makes "missing steps" a true no-op
+        if stride_mask is not None:
+            mask = mask * stride_mask.to(dtype=mask.dtype)
+
         s = s * mask  # zero means true no-op; prevents identity-bias artifacts
 
         # ---- run backbone ----

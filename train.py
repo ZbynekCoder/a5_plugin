@@ -1,5 +1,4 @@
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "7")
 
 import argparse
 import json
@@ -68,6 +67,9 @@ def parse_args():
         default=1,
         help="For gpt2_state (inject_mode=clean): hold the injected PRE-state for K steps (K>=1).",
     )
+    p.add_argument("--stride_mode", type=str, default="hold", choices=["hold", "sparse"])
+    p.add_argument("--stride_offset", type=int, default=0)
+
     p.add_argument("--local_files_only", action="store_true")
 
     # ---- TRAIN-TIME ablations ----
@@ -185,6 +187,8 @@ def train_step(model, args, x, y):
             reset_state=args.reset_state,
             gate_zero=args.gate_zero,
             state_stride=args.state_stride,
+            stride_mode=args.stride_mode,
+            stride_offset=args.stride_offset,
             inject_mode=args.train_inject_mode,
             inject_style=args.inject_style,
         )
@@ -245,6 +249,8 @@ def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len
                 reset_state=conf["reset_state"],
                 gate_zero=conf["gate_zero"],
                 state_stride=args.state_stride,
+                stride_mode=args.stride_mode,
+                stride_offset=args.stride_offset,
                 inject_mode=conf["inject_mode"],
                 inject_style=args.inject_style,
             )
