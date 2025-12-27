@@ -270,6 +270,9 @@ class GPT2FrozenStateFusion(nn.Module):
       - input_add: x = tok_emb + (masked state)
       - fusion    : use gated residual fusion hook at inject_layer
       - both      : do both (debug / sanity)
+
+    mid_once (clean-only):
+      - override mask to inject at exactly ONE non-terminal position + always inject last position.
     """
 
     def __init__(
@@ -365,6 +368,10 @@ class GPT2FrozenStateFusion(nn.Module):
             inject_style: str = "input_add",
             random_phase_shift: bool = False,
             phase_shift_mode: str = "batch",
+            # ---- mid-once injection (clean-only) ----
+            mid_once: bool = False,
+            mid_pos: int = -1,
+            mid_pos_mode: str = "batch",
     ):
         if inject_mode not in {"clean", "final", "prev", "none"}:
             raise ValueError(f"Unknown inject_mode: {inject_mode}")
@@ -416,7 +423,38 @@ class GPT2FrozenStateFusion(nn.Module):
         # Default: no extra stride mask
         stride_mask = None  # [B,T,1] or None
 
-        if inject_mode == "clean" and K > 1 and T > 0:
+        # ---- mid-once injection (clean-only) ----
+        # If enabled, we OVERRIDE the stride masking so that:
+        #   - exactly ONE non-terminal position gets injected (a "pilot"/bootstrap state)
+        #   - the last position is ALWAYS injected (to keep supervision aligned)
+        # This isolates whether a single mid-state exposure is sufficient to bootstrap state usage.
+        if bool(mid_once) and inject_mode == "clean" and T > 0:
+            if mid_pos_mode not in {"batch", "sample"}:
+                raise ValueError(f"Unknown mid_pos_mode: {mid_pos_mode}")
+
+            keep = torch.zeros((B, T, 1), device=device, dtype=torch.float32)
+
+            # choose one non-terminal position in [0, T-2] if possible
+            if T >= 2:
+                if mid_pos is not None and int(mid_pos) >= 0:
+                    t_mid = int(mid_pos)
+                    if t_mid >= T - 1:
+                        t_mid = T - 2
+                    keep[:, t_mid, 0] = 1.0
+                else:
+                    if mid_pos_mode == "batch":
+                        t_mid = int(torch.randint(low=0, high=T - 1, size=(1,), device=device).item())
+                        keep[:, t_mid, 0] = 1.0
+                    else:  # sample
+                        t_mid = torch.randint(low=0, high=T - 1, size=(B,), device=device)
+                        keep[torch.arange(B, device=device), t_mid, 0] = 1.0
+
+            # always inject at the last position
+            keep[:, T - 1, 0] = 1.0
+
+            stride_mask = keep  # [B,T,1]
+
+        if inject_mode == "clean" and (not bool(mid_once)) and K > 1 and T > 0:
             if stride_mode == "hold":
                 # your original behavior: hold the PRE-state for K steps
                 held = state_ids.clone()

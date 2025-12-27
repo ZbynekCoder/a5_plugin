@@ -83,6 +83,27 @@ def parse_args():
         help="How to randomize phase when --random_phase_shift is enabled. batch=one shift per batch, sample=independent shift per sample.",
     )
 
+    # ---- mid-once injection (clean-only) ----
+    p.add_argument(
+        "--mid_once",
+        action="store_true",
+        help="(gpt2_state + inject_mode=clean) override stride masking: inject state at exactly ONE non-terminal position plus always at the last position. "
+             "Used to test whether a single mid-state exposure can bootstrap state usage.",
+    )
+    p.add_argument(
+        "--mid_pos",
+        type=int,
+        default=-1,
+        help="Non-terminal position to inject when --mid_once is set (0..T-2). -1 => sample randomly (see --mid_pos_mode).",
+    )
+    p.add_argument(
+        "--mid_pos_mode",
+        type=str,
+        default="batch",
+        choices=["batch", "sample"],
+        help="When --mid_once and --mid_pos=-1: batch=one random mid position per batch; sample=independent random mid position per sample.",
+    )
+
     p.add_argument("--local_files_only", action="store_true")
 
     # ---- TRAIN-TIME ablations ----
@@ -206,6 +227,9 @@ def train_step(model, args, x, y):
             inject_style=args.inject_style,
             random_phase_shift=args.random_phase_shift,
             phase_shift_mode=args.phase_shift_mode,
+            mid_once=args.mid_once,
+            mid_pos=args.mid_pos,
+            mid_pos_mode=args.mid_pos_mode,
         )
 
     return model(x, labels=y)
@@ -270,6 +294,9 @@ def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len
                 inject_style=args.inject_style,
                 random_phase_shift=False,
                 phase_shift_mode="batch",
+                mid_once=args.mid_once,
+                mid_pos=args.mid_pos,
+                mid_pos_mode=args.mid_pos_mode,
             )
 
             print(f"[eval] step {step} | model {args.model} | style {args.inject_style} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")

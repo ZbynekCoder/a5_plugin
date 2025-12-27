@@ -100,6 +100,9 @@ def eval_final_acc(
         inject_style: str = "input_add",
         random_phase_shift: bool = False,
         phase_shift_mode: str = "batch",
+        mid_once: bool = False,
+        mid_pos: int = -1,
+        mid_pos_mode: str = "batch",
 ) -> float:
     model.eval()
     correct = 0
@@ -124,6 +127,9 @@ def eval_final_acc(
                 inject_style=inject_style,
                 random_phase_shift=random_phase_shift,
                 phase_shift_mode=phase_shift_mode,
+                mid_once=mid_once,
+                mid_pos=mid_pos,
+                mid_pos_mode=mid_pos_mode,
             )
         else:
             logits, _ = model(x, labels=None)
