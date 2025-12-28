@@ -1,373 +1,232 @@
-import os
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import random
+from dataclasses import asdict, dataclass
+from typing import Dict, List
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from a5_core import generate_a5, RandomSeqFinalDataset, eval_final_acc
-from models import (
-    BaselineAdapter,
-    GRUBaseline,
-    A5ExactScan,
-    Route1SoftScan,
-    GPT2FrozenBaseline,
-    GPT2FrozenStateFusion,
-)
+from a5_core import RandomSeqFinalDataset, eval_final_acc, generate_a5
+from models import GPT2FrozenStatePlugin
 
 
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
+@dataclass
+class HParams:
+    # basics
+    seed: int = 42
+    device: str = "cpu"
+    out_dir: str = "outputs"
 
-    # basic
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="cpu")
+    # data
+    train_samples: int = 200_000
+    test_samples_per_len: int = 10_000
+    schedule: str = "64"               # training lengths, comma-separated
+    steps_per_stage: int = 1000
+    eval_lens: str = "64,128,256,512"
 
-    # model selection
-    p.add_argument(
-        "--model",
-        type=str,
-        default="route1",
-        choices=["adapter", "gru", "exact", "route1", "gpt2", "gpt2_state"],
-    )
-    p.add_argument("--d_model", type=int, default=128)
+    # optimization
+    batch_size: int = 512
+    lr: float = 5e-3
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
 
-    # adapter
-    p.add_argument("--mlp_layers", type=int, default=2)
-    p.add_argument("--pool", type=str, default="mean", choices=["mean", "last"])
+    # model
+    gpt2_name: str = "openai-community/gpt2"
+    local_files_only: bool = False
+    inject_layer: int = 8
+    d_state: int = 128
+    inject_style: str = "input_add"    # input_add|fusion|both
 
-    # gru
-    p.add_argument("--gru_layers", type=int, default=1)
-    p.add_argument("--gru_dropout", type=float, default=0.0)
+    # train-time injection
+    train_inject_mode: str = "clean"   # clean|final|prev|none
+    shuffle_state: bool = False
+    reset_state: bool = False
+    gate_zero: bool = False
 
-    # route1
-    p.add_argument("--temp", type=float, default=1.0)
-    p.add_argument("--aux_weight", type=float, default=5.0)
-    p.add_argument("--anneal_aux", action="store_true")
+    # bandwidth / phase (clean)
+    state_stride: int = 1
+    stride_mode: str = "hold"          # hold|sparse
+    stride_offset: int = 0
+    random_phase_shift: bool = False
+    phase_shift_mode: str = "batch"    # batch|sample
 
-    # gpt2 frozen / state plugin
-    p.add_argument("--gpt2_name", type=str, default="openai-community/gpt2")
-    p.add_argument("--inject_layer", type=int, default=8)
-    p.add_argument("--d_state", type=int, default=128)
-    p.add_argument("--inject_style", type=str, default="input_add", choices=["input_add", "fusion", "both"])
-    p.add_argument(
-        "--state_stride",
-        type=int,
-        default=1,
-        help="For gpt2_state (inject_mode=clean): hold the injected PRE-state for K steps (K>=1).",
-    )
-    p.add_argument("--stride_mode", type=str, default="hold", choices=["hold", "sparse"])
-    p.add_argument("--stride_offset", type=int, default=0)
-    # ---- sparse stride phase randomization ----
-    p.add_argument(
-        "--random_phase_shift",
-        action="store_true",
-        help="(gpt2_state + stride_mode=sparse + inject_mode=clean) randomize the sparse injection phase each batch/sample during TRAIN. Disabled by default.",
-    )
-    p.add_argument(
-        "--phase_shift_mode",
-        type=str,
-        default="batch",
-        choices=["batch", "sample"],
-        help="How to randomize phase when --random_phase_shift is enabled. batch=one shift per batch, sample=independent shift per sample.",
-    )
+    # minimal bootstrapping (clean)
+    mid_once: bool = False
+    mid_pos: int = -1                  # 0..T-2, -1 => random
+    mid_pos_mode: str = "batch"        # batch|sample
 
-    # ---- mid-once injection (clean-only) ----
-    p.add_argument(
-        "--mid_once",
-        action="store_true",
-        help="(gpt2_state + inject_mode=clean) override stride masking: inject state at exactly ONE non-terminal position plus always at the last position. "
-             "Used to test whether a single mid-state exposure can bootstrap state usage.",
-    )
-    p.add_argument(
-        "--mid_pos",
-        type=int,
-        default=-1,
-        help="Non-terminal position to inject when --mid_once is set (0..T-2). -1 => sample randomly (see --mid_pos_mode).",
-    )
-    p.add_argument(
-        "--mid_pos_mode",
-        type=str,
-        default="batch",
-        choices=["batch", "sample"],
-        help="When --mid_once and --mid_pos=-1: batch=one random mid position per batch; sample=independent random mid position per sample.",
-    )
+    # eval
+    eval_every: int = 200
+    log_every: int = 100
+    eval_inject_modes: str = "clean,final"  # comma-separated
 
+
+def parse_args() -> HParams:
+    p = argparse.ArgumentParser("A5 state-channel learnability (frozen GPT-2 + teacher-state plugin)")
+
+    # basics
+    p.add_argument("--seed", type=int, default=HParams.seed)
+    p.add_argument("--device", type=str, default=HParams.device)
+    p.add_argument("--out_dir", type=str, default=HParams.out_dir)
+
+    # data
+    p.add_argument("--train_samples", type=int, default=HParams.train_samples)
+    p.add_argument("--test_samples_per_len", type=int, default=HParams.test_samples_per_len)
+    p.add_argument("--schedule", type=str, default=HParams.schedule)
+    p.add_argument("--steps_per_stage", type=int, default=HParams.steps_per_stage)
+    p.add_argument("--eval_lens", type=str, default=HParams.eval_lens)
+
+    # optimization
+    p.add_argument("--batch_size", type=int, default=HParams.batch_size)
+    p.add_argument("--lr", type=float, default=HParams.lr)
+    p.add_argument("--weight_decay", type=float, default=HParams.weight_decay)
+    p.add_argument("--grad_clip", type=float, default=HParams.grad_clip)
+
+    # model
+    p.add_argument("--gpt2_name", type=str, default=HParams.gpt2_name)
     p.add_argument("--local_files_only", action="store_true")
+    p.add_argument("--inject_layer", type=int, default=HParams.inject_layer)
+    p.add_argument("--d_state", type=int, default=HParams.d_state)
+    p.add_argument("--inject_style", type=str, default=HParams.inject_style, choices=["input_add", "fusion", "both"])
 
-    # ---- TRAIN-TIME ablations ----
+    # train-time injection
+    p.add_argument("--train_inject_mode", type=str, default=HParams.train_inject_mode, choices=["clean", "final", "prev", "none"])
     p.add_argument("--shuffle_state", action="store_true")
     p.add_argument("--reset_state", action="store_true")
     p.add_argument("--gate_zero", action="store_true")
 
-    # Train-time injection mode
-    p.add_argument(
-        "--train_inject_mode",
-        type=str,
-        default="clean",
-        choices=["clean", "final", "prev", "none"],
-        help="Train-time injection mode for gpt2_state. clean=PRE-states (anti-leak). final is oracle leak.",
-    )
+    # bandwidth / phase
+    p.add_argument("--state_stride", type=int, default=HParams.state_stride)
+    p.add_argument("--stride_mode", type=str, default=HParams.stride_mode, choices=["hold", "sparse"])
+    p.add_argument("--stride_offset", type=int, default=HParams.stride_offset)
+    p.add_argument("--random_phase_shift", action="store_true")
+    p.add_argument("--phase_shift_mode", type=str, default=HParams.phase_shift_mode, choices=["batch", "sample"])
 
-    # ---- EVAL bundle ----
-    p.add_argument("--eval_multi", action="store_true")
-    p.add_argument("--eval_inject_modes", type=str, default="clean,final,prev,none")
+    # minimal bootstrapping
+    p.add_argument("--mid_once", action="store_true")
+    p.add_argument("--mid_pos", type=int, default=HParams.mid_pos)
+    p.add_argument("--mid_pos_mode", type=str, default=HParams.mid_pos_mode, choices=["batch", "sample"])
 
-    p.add_argument("--eval_gate_zero", action="store_true")
-    p.add_argument("--eval_shuffle_state", action="store_true")
-    p.add_argument("--eval_reset_state", action="store_true")
+    # logging / eval
+    p.add_argument("--eval_every", type=int, default=HParams.eval_every)
+    p.add_argument("--log_every", type=int, default=HParams.log_every)
+    p.add_argument("--eval_inject_modes", type=str, default=HParams.eval_inject_modes)
 
-    # optimization
-    p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=5e-2)
-    p.add_argument("--weight_decay", type=float, default=0.0)
-
-    # data
-    p.add_argument("--train_samples", type=int, default=200000)
-    p.add_argument("--test_samples_per_len", type=int, default=10000)
-    p.add_argument("--schedule", type=str, default="64")
-    p.add_argument("--steps_per_stage", type=int, default=5000)
-    p.add_argument("--eval_lens", type=str, default="64,128,256,512")
-
-    # logging
-    p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--eval_every", type=int, default=1000)
-    p.add_argument("--out_dir", type=str, default="outputs")
-
-    # mechanism ablations for exact/route1 (executor-side)
-    p.add_argument("--no_scan", action="store_true")
-    p.add_argument("--shuffle_M", action="store_true")
-    p.add_argument("--reset_each_step", action="store_true")
-
-    return p.parse_args()
+    args = p.parse_args()
+    return HParams(**vars(args))
 
 
-def build_model(args, mul, id_id, device):
-    if args.model == "adapter":
-        return BaselineAdapter(
-            num_tokens=60,
-            d_model=max(args.d_model, 64),
-            mlp_layers=args.mlp_layers,
-            pool=args.pool,
-        ).to(device)
-
-    if args.model == "gru":
-        return GRUBaseline(
-            num_tokens=60,
-            d_model=max(args.d_model, 64),
-            num_layers=args.gru_layers,
-            dropout=args.gru_dropout,
-        ).to(device)
-
-    if args.model == "exact":
-        return A5ExactScan(mul_table=mul, id_id=id_id, num_tokens=60).to(device)
-
-    if args.model == "route1":
-        return Route1SoftScan(
-            mul_table=mul,
-            id_id=id_id,
-            num_tokens=60,
-            temp=args.temp,
-            aux_weight=args.aux_weight,
-        ).to(device)
-
-    if args.model == "gpt2":
-        return GPT2FrozenBaseline(
-            num_tokens=60,
-            gpt2_name=args.gpt2_name,
-            local_files_only=args.local_files_only,
-        ).to(device)
-
-    if args.model == "gpt2_state":
-        return GPT2FrozenStateFusion(
-            mul_table=mul,
-            id_id=id_id,
-            num_tokens=60,
-            gpt2_name=args.gpt2_name,
-            inject_layer=args.inject_layer,
-            d_state=args.d_state,
-            local_files_only=args.local_files_only,
-        ).to(device)
-
-    raise ValueError(args.model)
+def parse_csv_ints(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
-def train_step(model, args, x, y):
-    if args.model in {"exact", "route1"}:
-        return model(
-            x,
-            labels=y,
-            no_scan=args.no_scan,
-            shuffle_M=args.shuffle_M,
-            reset_each_step=args.reset_each_step,
-        )
-
-    if args.model == "gpt2_state":
-        return model(
-            x,
-            labels=y,
-            shuffle_state=args.shuffle_state,
-            reset_state=args.reset_state,
-            gate_zero=args.gate_zero,
-            state_stride=args.state_stride,
-            stride_mode=args.stride_mode,
-            stride_offset=args.stride_offset,
-            inject_mode=args.train_inject_mode,
-            inject_style=args.inject_style,
-            random_phase_shift=args.random_phase_shift,
-            phase_shift_mode=args.phase_shift_mode,
-            mid_once=args.mid_once,
-            mid_pos=args.mid_pos,
-            mid_pos_mode=args.mid_pos_mode,
-        )
-
-    return model(x, labels=y)
-
-
-def _parse_eval_inject_modes(s: str):
-    modes = []
+def parse_eval_modes(s: str) -> List[str]:
+    out: List[str] = []
     for t in s.split(","):
         m = t.strip()
         if not m:
             continue
         if m not in {"clean", "final", "prev", "none"}:
             raise ValueError(f"Unknown inject mode: {m}")
-        modes.append(m)
-    if not modes:
-        modes = ["clean"]
-
-    seen = set()
-    uniq = []
-    for m in modes:
-        if m not in seen:
-            uniq.append(m)
-            seen.add(m)
-    return uniq
+        if m not in out:
+            out.append(m)
+    return out or ["clean"]
 
 
 @torch.no_grad()
-def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len):
-    eval_modes = ["clean"]
-    if args.model == "gpt2_state" and args.eval_multi:
-        eval_modes = _parse_eval_inject_modes(args.eval_inject_modes)
+def run_eval(model, hp: HParams, eval_loaders: Dict[int, DataLoader], device: torch.device, step: int, stage_len: int, log_path: str) -> None:
+    eval_modes = parse_eval_modes(hp.eval_inject_modes)
 
-    eval_confs = []
-    for mode in eval_modes:
-        eval_confs.append((mode, dict(inject_mode=mode, shuffle_state=False, reset_state=False, gate_zero=False)))
-
-    if args.model == "gpt2_state" and args.eval_multi:
-        if args.eval_gate_zero:
-            eval_confs.append(("clean+gate0", dict(inject_mode="clean", shuffle_state=False, reset_state=False, gate_zero=True)))
-        if args.eval_shuffle_state:
-            eval_confs.append(("clean+shuffle", dict(inject_mode="clean", shuffle_state=True, reset_state=False, gate_zero=False)))
-        if args.eval_reset_state:
-            eval_confs.append(("clean+reset", dict(inject_mode="clean", shuffle_state=False, reset_state=True, gate_zero=False)))
-
-    for eval_tag, conf in eval_confs:
+    for inject_mode in eval_modes:
         for L, loader in eval_loaders.items():
             acc = eval_final_acc(
                 model,
                 loader,
                 device,
-                args.model,
-                no_scan=args.no_scan,
-                shuffle_M=args.shuffle_M,
-                reset_each_step=args.reset_each_step,
-                shuffle_state=conf["shuffle_state"],
-                reset_state=conf["reset_state"],
-                gate_zero=conf["gate_zero"],
-                state_stride=args.state_stride,
-                stride_mode=args.stride_mode,
-                stride_offset=args.stride_offset,
-                inject_mode=conf["inject_mode"],
-                inject_style=args.inject_style,
-                random_phase_shift=False,
+                inject_mode=inject_mode,
+                inject_style=hp.inject_style,
+                state_stride=hp.state_stride,
+                stride_mode=hp.stride_mode,
+                stride_offset=hp.stride_offset,
+                random_phase_shift=False,      # eval: deterministic
                 phase_shift_mode="batch",
-                mid_once=args.mid_once,
-                mid_pos=args.mid_pos,
-                mid_pos_mode=args.mid_pos_mode,
+                mid_once=hp.mid_once,
+                mid_pos=hp.mid_pos,
+                mid_pos_mode=hp.mid_pos_mode,
             )
 
-            print(f"[eval] step {step} | model {args.model} | style {args.inject_style} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")
+            print(f"[eval] step {step} | stage_len {stage_len} | inject_mode {inject_mode} | len {L} | acc {acc:.4f}")
 
             rec = {
                 "type": "eval",
                 "step": step,
                 "stage_len": stage_len,
-                "model": args.model,
-                "inject_style": args.inject_style,
-                "eval_tag": eval_tag,
+                "inject_mode": inject_mode,
                 "len": L,
-                "final_acc": acc,
-                "train_time": {
-                    "train_inject_mode": args.train_inject_mode,
-                    "shuffle_state": args.shuffle_state,
-                    "reset_state": args.reset_state,
-                    "gate_zero": args.gate_zero,
-                },
-                "eval_conf": conf,
-                "hparams": {
-                    "gpt2_name": args.gpt2_name if args.model in {"gpt2", "gpt2_state"} else None,
-                    "inject_layer": args.inject_layer if args.model == "gpt2_state" else None,
-                    "d_state": args.d_state if args.model == "gpt2_state" else None,
-                    "state_stride": args.state_stride if args.model == "gpt2_state" else None,
-                },
+                "acc": acc,
+                "hparams": asdict(hp),
             }
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-    set_seed(args.seed)
+def main() -> None:
+    hp = parse_args()
+    os.makedirs(hp.out_dir, exist_ok=True)
+    set_seed(hp.seed)
 
     _, mul, id_id = generate_a5()
-    device = torch.device(args.device)
+    device = torch.device(hp.device)
 
-    model = build_model(args, mul, id_id, device)
+    model = GPT2FrozenStatePlugin(
+        mul_table=mul,
+        id_id=id_id,
+        gpt2_name=hp.gpt2_name,
+        inject_layer=hp.inject_layer,
+        d_state=hp.d_state,
+        local_files_only=hp.local_files_only,
+    ).to(device)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = None
-    if trainable:
-        optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(trainable, lr=hp.lr, weight_decay=hp.weight_decay)
 
-    eval_lens = [int(x) for x in args.eval_lens.split(",") if x.strip()]
-    eval_loaders = {}
+    eval_lens = parse_csv_ints(hp.eval_lens)
+    eval_loaders: Dict[int, DataLoader] = {}
     for L in eval_lens:
-        ds = RandomSeqFinalDataset(mul, id_id, length=L, num_samples=args.test_samples_per_len, seed=args.seed + 100 + L)
-        eval_loaders[L] = DataLoader(ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
+        ds = RandomSeqFinalDataset(mul, id_id, length=L, num_samples=hp.test_samples_per_len, seed=hp.seed + 100 + L)
+        eval_loaders[L] = DataLoader(ds, batch_size=hp.batch_size, shuffle=False, drop_last=False)
 
-    schedule = [int(x) for x in args.schedule.split(",") if x.strip()]
+    schedule = parse_csv_ints(hp.schedule)
     assert len(schedule) >= 1
 
-    log_path = os.path.join(args.out_dir, "log_final.jsonl")
+    log_path = os.path.join(hp.out_dir, "log_final.jsonl")
     if os.path.exists(log_path):
         os.remove(log_path)
 
     win_correct = 0
     win_total = 0
-
     step = 0
-    for stage_len in schedule:
-        ds_train = RandomSeqFinalDataset(mul, id_id, length=stage_len, num_samples=args.train_samples, seed=args.seed + stage_len)
-        train_loader = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-        print(f"[stage_start] stage_len {stage_len} | steps {args.steps_per_stage}")
+    for stage_len in schedule:
+        ds_train = RandomSeqFinalDataset(mul, id_id, length=stage_len, num_samples=hp.train_samples, seed=hp.seed + stage_len)
+        train_loader = DataLoader(ds_train, batch_size=hp.batch_size, shuffle=True, drop_last=True)
+
+        print(f"[stage_start] stage_len {stage_len} | steps {hp.steps_per_stage}")
 
         it = iter(train_loader)
-        for _ in range(args.steps_per_stage):
+        for _ in range(hp.steps_per_stage):
             try:
                 batch = next(it)
             except StopIteration:
@@ -377,32 +236,46 @@ def main():
             x = batch["input_ids"].to(device)
             y = batch["label_final"].to(device)
 
-            logits, loss = train_step(model, args, x, y)
+            logits, loss = model(
+                x,
+                labels=y,
+                inject_mode=hp.train_inject_mode,
+                inject_style=hp.inject_style,
+                shuffle_state=hp.shuffle_state,
+                reset_state=hp.reset_state,
+                gate_zero=hp.gate_zero,
+                state_stride=hp.state_stride,
+                stride_mode=hp.stride_mode,
+                stride_offset=hp.stride_offset,
+                random_phase_shift=hp.random_phase_shift,
+                phase_shift_mode=hp.phase_shift_mode,
+                mid_once=hp.mid_once,
+                mid_pos=hp.mid_pos,
+                mid_pos_mode=hp.mid_pos_mode,
+            )
 
             pred = logits.argmax(dim=-1)
             win_correct += (pred == y).sum().item()
             win_total += y.numel()
 
-            if optimizer is not None:
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, hp.grad_clip)
+            optimizer.step()
 
-            if step % args.log_every == 0:
+            if step % hp.log_every == 0:
                 train_acc = win_correct / max(win_total, 1)
                 print(f"step {step} | stage_len {stage_len} | loss {loss.item():.6f} | train_acc(win) {train_acc:.4f}")
-
                 win_correct = 0
                 win_total = 0
 
-            if step % args.eval_every == 0 and step > 0:
-                run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len)
+            if step % hp.eval_every == 0 and step > 0:
+                run_eval(model, hp, eval_loaders, device, step, stage_len, log_path)
 
             step += 1
 
         print(f"[stage_end] stage_len {stage_len}")
-        run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len)
+        run_eval(model, hp, eval_loaders, device, step, stage_len, log_path)
 
     print(f"Logs written to: {log_path}")
 

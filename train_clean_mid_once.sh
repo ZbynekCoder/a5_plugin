@@ -1,13 +1,13 @@
 python train.py \
   --model gpt2_state \
   --gpt2_name openai-community/gpt2 --local_files_only \
-  --device cuda:6 \
+  --device cuda:7 \
   --train_inject_mode clean \
   --inject_style input_add \
   --mid_once \
-  --mid_pos 62 \
+  --mid_pos -1 \
   --mid_pos_mode batch \
-  --d_state 128 \
+  --d_state 3 \
   --inject_layer 8 \
   --lr 5e-3 \
   --schedule 64 \

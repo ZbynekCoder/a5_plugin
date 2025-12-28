@@ -1,16 +1,26 @@
+from __future__ import annotations
+
+import itertools
 import random
-from typing import List, Tuple, Dict
+from typing import Dict, List, Tuple
 
 import torch
 from torch.utils.data import Dataset
 
 
-def _compose(p: Tuple[int, ...], q: Tuple[int, ...]) -> Tuple[int, ...]:
+# ----------------------------
+# A5 group as even permutations on 5 letters
+# ----------------------------
+
+Perm = Tuple[int, ...]
+
+
+def _compose(p: Perm, q: Perm) -> Perm:
     """Permutation composition: (p ∘ q)(i) = p[q[i]]"""
     return tuple(p[q[i]] for i in range(len(p)))
 
 
-def _parity(perm: Tuple[int, ...]) -> int:
+def _parity(perm: Perm) -> int:
     """Return 0 if even, 1 if odd."""
     inv = 0
     n = len(perm)
@@ -21,15 +31,15 @@ def _parity(perm: Tuple[int, ...]) -> int:
     return inv % 2
 
 
-def generate_a5() -> Tuple[List[Tuple[int, ...]], List[List[int]], int]:
+def generate_a5() -> Tuple[List[Perm], List[List[int]], int]:
     """
     Generate A5 as even permutations on 5 letters.
+
     Returns:
       elems: list of 60 permutations (tuples)
-      mul: Cayley table ids: mul[g][s] = g ∘ s
+      mul: Cayley table ids: mul[g][s] = g ∘ s   (LEFT-multiply)
       id_id: identity element id
     """
-    import itertools
     perms = list(itertools.permutations(range(5)))
     elems = [p for p in perms if _parity(p) == 0]
     assert len(elems) == 60
@@ -46,10 +56,16 @@ def generate_a5() -> Tuple[List[Tuple[int, ...]], List[List[int]], int]:
     return elems, mul, id_id
 
 
+# ----------------------------
+# Dataset: random sequences, label is final prefix product
+# ----------------------------
+
 class RandomSeqFinalDataset(Dataset):
     """
     Random sequences of group element ids in [0..59].
-    Label: final prefix product y_T = x_T ∘ ... ∘ x_1, computed with mul.
+    Label: final prefix product s_T computed by:
+      s_0 = id
+      s_{t+1} = x_t ∘ s_t   (LEFT-multiply)
     """
 
     def __init__(self, mul: List[List[int]], id_id: int, length: int, num_samples: int, seed: int = 0):
@@ -60,19 +76,19 @@ class RandomSeqFinalDataset(Dataset):
         self.num_samples = int(num_samples)
 
         rng = random.Random(seed)
-        self.data = []
-        self.labels = []
+        self.data: List[List[int]] = []
+        labels: List[int] = []
         for _ in range(num_samples):
-            seq = [rng.randrange(60) for _ in range(length)]
+            seq = [rng.randrange(60) for _ in range(self.length)]
             s = self.id_id
             for g in seq:
-                s = self.mul[g][s]  # left multiply: s <- g ∘ s
+                s = self.mul[g][s]  # s <- g ∘ s
             self.data.append(seq)
-            self.labels.append(s)
+            labels.append(s)
 
-        self.labels = torch.tensor(self.labels, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.long)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -83,57 +99,42 @@ class RandomSeqFinalDataset(Dataset):
 
 @torch.no_grad()
 def eval_final_acc(
-        model,
-        loader,
-        device,
-        model_name: str,
-        no_scan: bool = False,
-        shuffle_M: bool = False,
-        reset_each_step: bool = False,
-        shuffle_state: bool = False,
-        reset_state: bool = False,
-        gate_zero: bool = False,
-        state_stride: int = 1,
-        stride_mode: str = "hold",
-        stride_offset: int = 0,
-        inject_mode: str = "clean",
-        inject_style: str = "input_add",
-        random_phase_shift: bool = False,
-        phase_shift_mode: str = "batch",
-        mid_once: bool = False,
-        mid_pos: int = -1,
-        mid_pos_mode: str = "batch",
+    model,
+    loader,
+    device,
+    *,
+    inject_mode: str,
+    inject_style: str,
+    state_stride: int,
+    stride_mode: str,
+    stride_offset: int,
+    random_phase_shift: bool,
+    phase_shift_mode: str,
+    mid_once: bool,
+    mid_pos: int,
+    mid_pos_mode: str,
 ) -> float:
+    """Accuracy of predicting final group state s_T."""
     model.eval()
     correct = 0
     total = 0
     for batch in loader:
         x = batch["input_ids"].to(device)
         y = batch["label_final"].to(device)
-
-        if model_name in {"exact", "route1"}:
-            logits, _ = model(x, labels=None, no_scan=no_scan, shuffle_M=shuffle_M, reset_each_step=reset_each_step)
-        elif model_name == "gpt2_state":
-            logits, _ = model(
-                x,
-                labels=None,
-                shuffle_state=shuffle_state,
-                reset_state=reset_state,
-                gate_zero=gate_zero,
-                state_stride=state_stride,
-                stride_mode=stride_mode,
-                stride_offset=stride_offset,
-                inject_mode=inject_mode,
-                inject_style=inject_style,
-                random_phase_shift=random_phase_shift,
-                phase_shift_mode=phase_shift_mode,
-                mid_once=mid_once,
-                mid_pos=mid_pos,
-                mid_pos_mode=mid_pos_mode,
-            )
-        else:
-            logits, _ = model(x, labels=None)
-
+        logits, _ = model(
+            x,
+            labels=None,
+            inject_mode=inject_mode,
+            inject_style=inject_style,
+            state_stride=state_stride,
+            stride_mode=stride_mode,
+            stride_offset=stride_offset,
+            random_phase_shift=random_phase_shift,
+            phase_shift_mode=phase_shift_mode,
+            mid_once=mid_once,
+            mid_pos=mid_pos,
+            mid_pos_mode=mid_pos_mode,
+        )
         pred = logits.argmax(dim=-1)
         correct += (pred == y).sum().item()
         total += y.numel()
